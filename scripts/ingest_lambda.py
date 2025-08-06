@@ -139,7 +139,6 @@ class BidenArchiveHTMLScrapper(DataSource):
                     return []
 
                 for page in pages:
-                    # print(f"page is {page.text.strip().split(" }")
                     next_page = int(page.text.strip().split(" ")[1])
                     next_url = page.get("href", "")
                     self.url = (
@@ -150,40 +149,44 @@ class BidenArchiveHTMLScrapper(DataSource):
                     if self.url != "":
                         break
 
-                print(f"self url is {self.url}")
-
                 # handle articles for the current page
                 articles = soup.find_all(
                     "div",
-                    class_=" article-wrapper col col-xs-12 col-md-8 col-lg-6 offset-lg-3",
+                    class_="article-wrapper col col-xs-12 col-md-8 col-lg-6 offset-lg-3",
                 )
                 if not articles:
                     return []
 
                 for article in articles:
-                    items = article.find_all("li")
+                    items = article.find_all("article")
                     for item in items:
                         date = str(
-                            item.find("div", class_="wp-block-post-date")
+                            item.find("div", class_="news-item__meta shared-meta")
                             .find("time")
                             .get("datetime", "")
                         )
-                        headline = item.find("h2", class_="wp-block-post-title")
-                        link = headline.find("a")["href"]
+                        headline = item.find("h2", class_="news-item__title-container")
+                        link = f"https://bidenwhitehouse.archives.gov{headline.find("a")["href"]}"
                         headline = headline.text.strip()
+                        print(f"link is {link}")
 
                         article_response = requests.get(link, timeout=10)
                         article_response.raise_for_status()
+                        with open(f"{headline}.html", "w") as f:
+                            f.write(article_response.text)
+
                         soup = BeautifulSoup(article_response.text, "html.parser")
                         content_div = soup.find(
-                            "div",
-                            class_="entry-content wp-block-post-content has-global-padding is-layout-constrained wp-block-post-content-is-layout-constrained",
+                            "section",
+                            class_="body-content",
                         )
+
                         content = (
                             content_div.get_text()
                             .split("Briefings & Statements", 1)[-1]
                             .strip()
                         )
+
                         article_data.append(
                             {
                                 "content": content,
