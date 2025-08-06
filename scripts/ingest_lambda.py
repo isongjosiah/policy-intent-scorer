@@ -20,9 +20,7 @@ class WhiteHouseHTMLScrapper(DataSource):
 
     def get_data(self) -> List:
         article_data: List[Dict] = []
-        count = 0
-        while self.url != "" and count <= 2:
-            count += 1
+        while self.url != "":
             print(f"Scraping URL: {self.url}")
             try:
                 response = requests.get(self.url, timeout=10)
@@ -115,9 +113,7 @@ class BidenArchiveHTMLScrapper(DataSource):
 
     def get_data(self) -> List:
         article_data: List[Dict] = []
-        count = 0
-        while self.url != "" and count <= 2:
-            count += 1
+        while self.url != "":
             print(f"Scraping URL: {self.url}")
             try:
                 response = requests.get(self.url, timeout=10)
@@ -222,76 +218,61 @@ class ObamaArchiveHTMLScrapper(DataSource):
 
     def get_data(self) -> List:
         article_data: List[Dict] = []
-        count = 0
-        while self.url != "" and count <= 2:
-            count += 1
+        while self.url != "":
             print(f"Scraping URL: {self.url}")
             try:
                 response = requests.get(self.url, timeout=10)
                 response.raise_for_status()
                 soup = BeautifulSoup(response.text, "html.parser")
-
-                # identify the current page
-                current_page = soup.find_all("span", class_="page-numbers current")
+                current_page = soup.find_all("li", class_="pager-current")
                 if not current_page:
                     return []
-                current_page = int(current_page[0].text.strip())
-                print(f"current page is {current_page}")
+                current_page = int(current_page[0].text.strip().split(" ")[0])
 
                 # keep track of the next page
-                pages = soup.find_all("a", class_="page-numbers")
-                if not pages:
-                    return []
+                next_page = soup.find("li", class_="pager-next last")
+                next_page = next_page.find("a").get("href", "")
+                self.url = f"https://obamawhitehouse.archives.gov{next_page}" if next_page != "" else ""
 
-                for page in pages:
-                    next_page = int(page.text.strip())
-                    next_url = page.get("href", "")
-                    self.url = next_url if next_page > current_page else ""
-                    if self.url != "":
-                        break
 
                 # handle articles for the current page
                 articles = soup.find_all(
-                    "ul",
-                    class_="wp-block-post-template is-layout-flow wp-block-post-template-is-layout-flow",
+                    "div",
+                    class_="view-content",
                 )
                 if not articles:
                     return []
 
                 for article in articles:
-                    items = article.find_all("li")
+                    items = article.find_all("div", class_="views-row")
                     for item in items:
-                        date = str(
-                            item.find("div", class_="wp-block-post-date")
-                            .find("time")
-                            .get("datetime", "")
-                        )
-                        headline = item.find("h2", class_="wp-block-post-title")
-                        link = headline.find("a")["href"]
-                        headline = headline.text.strip()
+                        date = item.find("div", class_="views-field-created").text.strip()
+                        headline = item.find("h3", class_="field-content").text.strip()
+                        link = f"https://obamawhitehouse.archives.gov{item.find("a")["href"]}"
 
                         article_response = requests.get(link, timeout=10)
                         article_response.raise_for_status()
                         soup = BeautifulSoup(article_response.text, "html.parser")
                         content_div = soup.find(
                             "div",
-                            class_="entry-content wp-block-post-content has-global-padding is-layout-constrained wp-block-post-content-is-layout-constrained",
+                            class_="field field-name-field-forall-body field-type-text-long field-label-hidden forall-body",
                         )
                         content = (
                             content_div.get_text()
                             .split("Briefings & Statements", 1)[-1]
                             .strip()
                         )
+
+                        date_format = "%B %d, %Y"
                         article_data.append(
                             {
                                 "content": content,
                                 "headline": headline,
                                 "link": link,
-                                "date": datetime.fromisoformat(date),
+                                "date": datetime.strptime(date, date_format),
                             }
                         )
-
-            except (requests.RequestException, IndexError, TypeError) as e:
+            except (requests.RequestException, IndexError, TypeError, Exception) as e:
                 print(f"Error scraping primary URL: {e}")
                 return []
         return article_data
@@ -317,78 +298,50 @@ class BushArchiveHTMLScrapper(DataSource):
 
     def get_data(self) -> List:
         article_data: List[Dict] = []
-        count = 0
-        while self.url != "" and count <= 2:
-            count += 1
-            print(f"Scraping URL: {self.url}")
-            try:
-                response = requests.get(self.url, timeout=10)
-                response.raise_for_status()
-                soup = BeautifulSoup(response.text, "html.parser")
+        print(f"Scraping URL: {self.url}")
+        try:
+            response = requests.get(self.url, timeout=10)
+            response.raise_for_status()
 
-                # identify the current page
-                current_page = soup.find_all("span", class_="page-numbers current")
-                if not current_page:
-                    return []
-                current_page = int(current_page[0].text.strip())
-                print(f"current page is {current_page}")
+            soup = BeautifulSoup(response.text, "html.parser")
+            articles = soup.find("table", class_="archive")
+            items = articles.find_all("tr")
+            count = 0
+            for item in items:
+                if count >= 3:
+                    break
+                count +=1
+                date = item.find("td", class_="archive-date-cell")
+                if not date:
+                    continue
+                date = datetime.strptime(date.text.strip(), "%b. %d, %Y")
+                print("date is ", date)
+                headline=item.find("a")
+                link = f"https://georgewbush-whitehouse.archives.gov{headline.get("href", "")}"
+                headline=headline.text.strip()
+                print(f"link is {link}")
+                print(f"headline is {headline}")
 
-                # keep track of the next page
-                pages = soup.find_all("a", class_="page-numbers")
-                if not pages:
-                    return []
+                article_response = requests.get(link, timeout=10)
+                article_response.raise_for_status()
+                with open(f"{headline}.html", "w") as f:
+                    f.write(article_response.text)
 
-                for page in pages:
-                    next_page = int(page.text.strip())
-                    next_url = page.get("href", "")
-                    self.url = next_url if next_page > current_page else ""
-                    if self.url != "":
-                        break
-
-                # handle articles for the current page
-                articles = soup.find_all(
-                    "ul",
-                    class_="wp-block-post-template is-layout-flow wp-block-post-template-is-layout-flow",
+                soup = BeautifulSoup(article_response.text, "html.parser")
+                content_div = soup.find("p")
+                content = content_div.get_text()
+                article_data.append(
+                    {
+                        "content": content,
+                        "headline": headline,
+                        "link": link,
+                        "date": date,
+                    }
                 )
-                if not articles:
-                    return []
 
-                for article in articles:
-                    items = article.find_all("li")
-                    for item in items:
-                        date = str(
-                            item.find("div", class_="wp-block-post-date")
-                            .find("time")
-                            .get("datetime", "")
-                        )
-                        headline = item.find("h2", class_="wp-block-post-title")
-                        link = headline.find("a")["href"]
-                        headline = headline.text.strip()
-
-                        article_response = requests.get(link, timeout=10)
-                        article_response.raise_for_status()
-                        soup = BeautifulSoup(article_response.text, "html.parser")
-                        content_div = soup.find(
-                            "div",
-                            class_="entry-content wp-block-post-content has-global-padding is-layout-constrained wp-block-post-content-is-layout-constrained",
-                        )
-                        content = (
-                            content_div.get_text()
-                            .split("Briefings & Statements", 1)[-1]
-                            .strip()
-                        )
-                        article_data.append(
-                            {
-                                "content": content,
-                                "headline": headline,
-                                "link": link,
-                                "date": datetime.fromisoformat(date),
-                            }
-                        )
-
-            except (requests.RequestException, IndexError, TypeError) as e:
-                print(f"Error scraping primary URL: {e}")
-                return []
+        except (requests.RequestException, IndexError, TypeError, Exception) as e:
+            print(f"Error scraping primary URL: {e}")
+            return []
         return article_data
 
     def fetch_body_from_url(self, url):
@@ -463,16 +416,19 @@ class IngestionService:
 
 
 def pull_archive() -> pd.DataFrame:
-    archive_links = [
+    archive_links: List[DataSource] = [
+        WhiteHouseHTMLScrapper(
+            "https://www.whitehouse.gov/briefings-statements/"
+        ),
         BidenArchiveHTMLScrapper(
             "https://bidenwhitehouse.archives.gov/briefing-room/press-briefings/"
         ),
-        # ObamaArchiveHTMLScrapper(
-        #    "https://obamawhitehouse.archives.gov/briefing-room/press-briefings"
-        # ),
-        # BushArchiveHTMLScrapper(
-        #    "https://georgewbush-whitehouse.archives.gov/news/briefings/"
-        # ),
+        ObamaArchiveHTMLScrapper(
+        "https://obamawhitehouse.archives.gov/briefing-room/press-briefings"
+        ),
+        BushArchiveHTMLScrapper(
+           "https://georgewbush-whitehouse.archives.gov/news/briefings/"
+        ),
     ]
     archive_df: pd.DataFrame = pd.DataFrame()
 
@@ -483,19 +439,26 @@ def pull_archive() -> pd.DataFrame:
         )
 
         data = ingestion_service.get_all_releases()
+        with open(f"data/{data_source.url}.json", "w") as f:
+            f.write(f"{data}")
+
         if data:
             print(f"Successfully scraped {len(data)} press releases.")
             df = pd.DataFrame(data)
+            print(df.head())
             df["year"] = df["date"].dt.strftime("%Y")
             df["month"] = df["date"].dt.strftime("%m")
             df["day"] = df["date"].dt.strftime("%d")
 
             archive_df = pd.concat([archive_df, df])
 
+        archive_df.to_parquet("data/archive.parquet", index=False)
+        archive_df.to_csv("data/archive.csv", index=False)
+
     return archive_df
 
 
-def handler(event, context) -> pd.DataFrame:
+def handler(event, context):
     # TODO: handle archive list
     primary_url = "https://www.whitehouse.gov/briefings-statements/"
     fallback_url = "https://www.whitehouse.gov/briefing-room/feed/"
