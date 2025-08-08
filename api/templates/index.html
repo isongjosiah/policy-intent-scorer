@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Policy Intent Scorer</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@1/css/pico.min.css">
+    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+</head>
+<body>
+    <main class="container">
+        <nav>
+            <ul>
+                <li><strong>Policy Intent Scorer</strong></li>
+            </ul>
+        </nav>
+        <article>
+            <form hx-post="/score_text" hx-target="#result" hx-swap="innerHTML">
+                <label for="text">Press Release Text</label>
+                <textarea id="text" name="text" rows="10" required></textarea>
+                <button type="submit">Score Intent</button>
+            </form>
+            <div id="result" style="margin-top: 1rem;"></div>
+        </article>
+    </main>
+</body>
+</html>

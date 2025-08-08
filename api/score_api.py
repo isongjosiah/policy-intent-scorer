@@ -11,8 +11,9 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from config.config import settings
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Request, Form
+from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 from redis.asyncio import Redis
 from fastapi_limiter import FastAPILimiter
@@ -28,6 +29,9 @@ app = FastAPI(
     description="API for scoring policy intent in press releases",
     version="1.0.0",
 )
+
+# Templates
+templates = Jinja2Templates(directory="api/templates")
 
 # Global model variable
 model: Optional[object] = None
@@ -132,6 +136,66 @@ async def shutdown():
         logger.error(f"Error during shutdown: {e}")
 
 
+@app.get("/", response_class=HTMLResponse)
+def read_root(request: Request):
+    """Serve the index.html file."""
+    return templates.TemplateResponse("index.html", {"request": request})
+
+
+@app.post("/score_text", response_class=HTMLResponse)
+async def score_text(request: Request, text: str = Form(...)):
+    """Score the text from the form and return an HTML fragment."""
+    if model is None:
+        return HTMLResponse(
+            content="<p>Model not available. Service is temporarily unavailable.</p>",
+            status_code=503,
+        )
+
+    try:
+        # Split text into headline and body
+        lines = text.strip().split("\n")
+        headline = lines[0]
+        body = "\n".join(lines[1:]) if len(lines) > 1 else ""
+
+        # Combine for scoring
+        text_to_score = f"{headline.strip()} {body.strip()}"
+
+        if len(text_to_score.strip()) < 10:
+            return HTMLResponse(
+                content="<p>Combined headline and body must be at least 10 characters long.</p>",
+                status_code=400,
+            )
+
+        # Get prediction
+        prediction_proba = model.predict_proba([text_to_score])
+        actionable_probability = prediction_proba[0][1]
+        intent_score = round(actionable_probability * 100, 1)
+
+        # Determine confidence
+        distance_from_neutral = abs(intent_score - 50)
+        if distance_from_neutral > 35:
+            confidence = "high"
+        elif distance_from_neutral > 20:
+            confidence = "medium"
+        else:
+            confidence = "low"
+
+        # Return HTML fragment
+        return HTMLResponse(
+            content=f"""
+                <p><strong>Intent Score:</strong> {intent_score}</p>
+                <p><strong>Confidence:</strong> {confidence}</p>
+            """,
+        )
+
+    except Exception as e:
+        logger.error(f"Error during prediction: {str(e)}")
+        return HTMLResponse(
+            content="<p>Internal server error during prediction.</p>",
+            status_code=500,
+        )
+
+
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
     """Health check endpoint."""
@@ -211,7 +275,7 @@ async def score_policy_intent(
 
 
 @app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
+def global_exception_handler(request: Request, exc: Exception):
     """Global exception handler."""
     logger.error(f"Unhandled exception: {str(exc)}", exc_info=True)
     return JSONResponse(status_code=500, content={"detail": "Internal server error"})
@@ -222,13 +286,13 @@ if __name__ == "__main__":
     import uvicorn
 
     # Load environment variables for development
-    port = int(os.getenv("PORT", 8000))
+    port = int(os.getenv("PORT", 8081))
     host = os.getenv("HOST", "0.0.0.0")
     debug = os.getenv("DEBUG", "false").lower() == "true"
 
     logger.info(f"Starting server on {host}:{port}")
     uvicorn.run(
-        "main:app" if not debug else app,
+        "score_api:app" if not debug else app,
         host=host,
         port=port,
         reload=debug,
