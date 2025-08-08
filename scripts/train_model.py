@@ -1,4 +1,11 @@
+import sys
 import os
+
+# Add the project root to the Python path
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
 import pandas as pd
 import boto3
 import pickle
@@ -418,15 +425,8 @@ def create_pipeline_from_config(config: Dict[str, Any]) -> MLTrainingPipeline:
 
 
 if __name__ == "__main__":
-    # Environment variables (backwards compatible)
-    S3_PROCESSED_BUCKET = os.environ.get("S3_PROCESSED_BUCKET")
-    S3_MODEL_BUCKET = os.environ.get("S3_MODEL_BUCKET")
-    LOCAL_DATA_PATH = os.environ.get("LOCAL_DATA_PATH", "./data/processed/")
-    LOCAL_MODEL_PATH = os.environ.get("LOCAL_MODEL_PATH", "./models/")
-    MODEL_FILE_NAME = os.environ.get("MODEL_FILE_NAME", "text_classifier_model.pkl")
-
-    # Determine configuration based on environment
-    if S3_PROCESSED_BUCKET and S3_MODEL_BUCKET:
+    # Determine configuration based on environment settings
+    if settings.S3_BUCKET and settings.S3_MODEL_BUCKET:
         # S3 configuration
         config = {
             "data_source_type": "s3",
@@ -434,8 +434,8 @@ if __name__ == "__main__":
             "use_s3": True,
             "trainer": {"target_roc_auc": 0.7, "max_features": 5000, "test_size": 0.2},
         }
-        data_source = f"s3://{S3_PROCESSED_BUCKET}/processed/"
-        model_destination = S3_MODEL_BUCKET
+        data_source = f"s3://{settings.S3_BUCKET}/processed/"
+        model_destination = settings.S3_MODEL_BUCKET
 
     else:
         # Local configuration
@@ -445,13 +445,13 @@ if __name__ == "__main__":
             "use_s3": False,
             "trainer": {"target_roc_auc": 0.7, "max_features": 5000, "test_size": 0.2},
         }
-        data_source = LOCAL_DATA_PATH
-        model_destination = LOCAL_MODEL_PATH
+        data_source = settings.LOCAL_DATA_PATH
+        model_destination = settings.LOCAL_MODEL_PATH
 
     try:
         # Create and run pipeline
         pipeline = create_pipeline_from_config(config)
-        success = pipeline.run(data_source, model_destination, MODEL_FILE_NAME)
+        success = pipeline.run(data_source, model_destination, settings.MODEL_FILE_NAME)
 
         if success:
             logger.info("🎉 Training completed successfully!")

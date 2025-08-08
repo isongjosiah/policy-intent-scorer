@@ -1,15 +1,22 @@
+import sys
+import os
+
+# Add the project root to the Python path
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
 from config.config import settings
 import requests
 import yfinance as yf
 import pandas as pd
-import boto3
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple, Any
 import re
 import math
 import logging
-from collections import Counter, defaultdict
-from abc import ABC, abstractmethod
+from collections import Counter
+from abc import abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -268,6 +275,16 @@ class KeywordExtractor:
         )
 
 
+@dataclass
+class Bill:
+    """Data class for a bill from the Congress.gov API."""
+
+    title: str
+    url: str
+    latest_action_date: Optional[datetime] = None
+    status: Optional[str] = None
+
+
 class CongressAPIClient:
     """Client for Congress.gov API interactions."""
 
@@ -276,29 +293,56 @@ class CongressAPIClient:
         self.timeout = timeout
         self.base_url = "https://api.congress.gov/v3"
 
-    def search_bills(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
+    def search_bills(
+        self, query: str, limit: int = 20, offset: int = 0, sort: str = "relevance"
+    ) -> List[Bill]:
         """Search for bills using the Congress.gov API."""
         try:
-            url = f"{self.base_url}/bill/search"
+            url = f"{self.base_url}/bill"
             params = {
                 "query": query,
                 "api_key": self.api_key,
                 "limit": limit,
+                "offset": offset,
+                "sort": sort,
                 "format": "json",
             }
 
             response = requests.get(url, params=params, timeout=self.timeout)
-            response.raise_for_status()
+            response.raise_for_status()  # Raise an exception for bad status codes (4xx or 5xx)
 
             data = response.json()
-            return data.get("bills", [])
+            bills = []
+            for item in data.get("bills", []):
+                bills.append(
+                    Bill(
+                        title=item.get("title"),
+                        url=item.get("url"),
+                        latest_action_date=self._to_datetime(
+                            item.get("latestAction", {}).get("actionDate")
+                        ),
+                        status=item.get("status"),
+                    )
+                )
+            return bills
 
-        except requests.RequestException as e:
-            logger.warning(f"Error searching Congress API for '{query}': {e}")
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"HTTP error searching Congress API for '{query}': {e}")
+            return []
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error searching Congress API for '{query}': {e}")
             return []
         except (ValueError, KeyError) as e:
-            logger.warning(f"Error parsing Congress API response for '{query}': {e}")
+            logger.error(f"Error parsing Congress API response for '{query}': {e}")
             return []
+
+    def _to_datetime(self, date_str: Optional[str]) -> Optional[datetime]:
+        if not date_str:
+            return None
+        try:
+            return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return None
 
 
 class MarketDataClient:
@@ -439,22 +483,10 @@ class CongressOutcomeChecker(OutcomeChecker):
             bills = self.congress_client.search_bills(term)
 
             for bill in bills:
-                if bill.get("status") == "Became Law":
-                    law_date_str = bill.get("signed_date")
-                    if law_date_str:
-                        try:
-                            law_date = datetime.fromisoformat(
-                                law_date_str.replace("Z", "+00:00")
-                            )
-                            days_diff = (law_date - pub_date).days
-
-                            if 0 < days_diff <= 180:
-                                return True, bill.get("url"), days_diff
-                        except (ValueError, TypeError) as e:
-                            logger.warning(
-                                f"Error parsing law date {law_date_str}: {e}"
-                            )
-                            continue
+                if bill.status == "Became Law" and bill.latest_action_date:
+                    days_diff = (bill.latest_action_date - pub_date).days
+                    if 0 < days_diff <= 180:
+                        return True, bill.url, days_diff
 
         return False, None, None
 
@@ -665,9 +697,9 @@ def main():
     labeled_results = []
     for _, row in df_raw.iterrows():
         try:
-            pub_date = datetime.fromisoformat(row["published_date"])
+            pub_date = row["date"]
             result = labeling_service.label_press_release(
-                row["headline"], row["body"], pub_date
+                row["headline"], row["content"], pub_date
             )
             labeled_results.append(result.__dict__)
         except Exception as e:
@@ -694,12 +726,10 @@ def handler(event, context):
     try:
         # Environment configuration
         config = {
-            "congress_api_key": os.environ.get("CONGRESS_API_KEY"),
-            "market_sectors": os.environ.get("MARKET_SECTORS", "SPY,XLI,XLE,XLF").split(
-                ","
-            ),
-            "s3_raw_bucket": os.environ.get("S3_RAW_BUCKET"),
-            "s3_processed_bucket": os.environ.get("S3_PROCESSED_BUCKET"),
+            "congress_api_key": settings.CONGRESS_API_KEY,
+            "market_sectors": settings.MARKET_SECTORS,
+            "s3_raw_bucket": settings.S3_BUCKET,  # Using the main S3 bucket
+            "s3_processed_bucket": settings.S3_BUCKET,  # Using the main S3 bucket
         }
 
         # Validate configuration

@@ -30,14 +30,16 @@ class Settings:
             ","
         )
         self.INPUT_FILE = os.environ.get(
-            "INPUT_FILE", "./data/raw_archive_latest.parquet"
+            "INPUT_FILE", "../data/raw_archive_latest.parquet"
         )
         self.OUTPUT_FILE = os.environ.get(
-            "OUTPUT_FILE", "./data/labeled_archive_latest.parquet"
+            "OUTPUT_FILE", "../data/processed_archive_latest.parquet"
         )
         self.S3_MODEL_BUCKET = os.environ.get("S3_MODEL_BUCKET")
-        self.LOCAL_DATA_PATH = os.environ.get("LOCAL_DATA_PATH", "./data/processed/")
-        self.LOCAL_MODEL_PATH = os.environ.get("LOCAL_MODEL_PATH", "./models/")
+        self.LOCAL_DATA_PATH = os.environ.get(
+            "LOCAL_DATA_PATH", "../data/raw_archive_latest.parquet"
+        )
+        self.LOCAL_MODEL_PATH = os.environ.get("LOCAL_MODEL_PATH", "../model/")
         self.MODEL_FILE_NAME = os.environ.get(
             "MODEL_FILE_NAME",
             "text_classifier_model.pkl",
@@ -45,3 +47,4 @@ class Settings:
 
 
 settings = Settings()
+
