@@ -20,6 +20,7 @@ class Settings:
         LOCAL_DATA_PATH (str): The local path for data.
         LOCAL_MODEL_PATH (str): The local path for models.
         MODEL_FILE_NAME (str): The name of the model file.
+        OFFLINE_MODE (bool): Whether to run in offline mode.
     """
 
     def __init__(self):
@@ -44,7 +45,11 @@ class Settings:
             "MODEL_FILE_NAME",
             "text_classifier_model.pkl",
         )
+        self.OFFLINE_MODE = os.environ.get("OFFLINE_MODE", "false").lower() in (
+            "true",
+            "1",
+            "t",
+        )
 
 
 settings = Settings()
-
