@@ -1,4 +1,4 @@
-import os
+from config.config import settings
 import pickle
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
@@ -19,7 +19,7 @@ class PolicyIntentRequest(BaseModel):
 # Redis and rate limiter setup
 # For local development, use a local Redis instance.
 # For production, this would point to an Amazon ElastiCache for Redis endpoint.
-redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379")
+redis_url = settings.REDIS_URL
 
 
 @app.on_event("startup")
