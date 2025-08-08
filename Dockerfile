@@ -18,4 +18,4 @@ COPY . /app
 EXPOSE 8000
 
 # Command to run the FastAPI app
-CMD ["poetry", "run", "uvicorn",  "api.score_api:app", "--host", "0.0.0.0", "--port", "8081"]
+CMD ["poetry", "run", "uvicorn",  "api.score_api:app", "--host", "0.0.0.0", "--port", "80"]
