@@ -5,6 +5,10 @@ import asyncio
 import aiohttp
 from typing import List, Dict, Optional, Tuple, Any
 
+from numpy import roll
+from pandas.core.generic import pprint_thing
+from pandas.core.window import rolling
+
 
 # Add the project root to the Python path
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -389,7 +393,7 @@ class AsyncMarketDataClient:
         self.semaphore = asyncio.Semaphore(max_concurrent)
 
     async def get_stock_data(
-        self, ticker: List[str], start_date: datetime, end_date: datetime
+        self, tickers: List[str], start_date: datetime, end_date: datetime
     ) -> Optional[pd.DataFrame]:
         """Fetch stock data for a given ticker and date range."""
         async with self.semaphore:  # Limit concurrent requests
@@ -399,7 +403,7 @@ class AsyncMarketDataClient:
                 df = await loop.run_in_executor(
                     None,
                     lambda: yf.download(
-                        ticker,
+                        tickers,
                         start=start_date.strftime("%Y-%m-%d"),
                         end=end_date.strftime("%Y-%m-%d"),
                         progress=False,
@@ -419,30 +423,27 @@ class AsyncMarketDataClient:
 
     async def calculate_volatility_spike(
         self,
-        ticker: List[str],
+        tickers: List[str],
         pub_date: datetime,
         lookback_days: int = 30,
         threshold: float = 2.0,
-    ) -> Tuple[bool, float]:
+    ) -> Tuple[bool, float, str]:
         """Calculate if there was a significant volatility spike."""
         if pub_date.weekday() > 4:  # Skip weekends
-            return False, 0.0
+            return False, 0.0, ""
 
         start_date = pub_date - timedelta(days=lookback_days + 5)
         end_date = pub_date + timedelta(days=2)
 
-        df = await self.get_stock_data(ticker, start_date, end_date)
+        df = await self.get_stock_data(tickers, start_date, end_date)
         if df is None or len(df) < lookback_days:
-            return False, 0.0
-        print(f"stock data|{ticker}")
-        print(df)
+            return False, 0.0, ""
 
         try:
-            daily_returns = df["Close"].pct_change(fill_method=None).dropna()
-            print("daily returns", daily_returns)
+            daily_returns = df["Close"].pct_change(fill_method=None).fillna(0)
 
             if len(daily_returns) < lookback_days:
-                return False, 0.0
+                return False, 0.0, ""
 
             pub_date_str = pub_date.strftime("%Y-%m-%d")
             if pub_date_str not in daily_returns.index:
@@ -450,27 +451,32 @@ class AsyncMarketDataClient:
                     daily_returns.index >= pub_date_str
                 ]
                 if len(available_dates) == 0:
-                    return False, 0.0
+                    return False, 0.0, ""
                 pub_date_str = available_dates[0]
 
             day_return = daily_returns.loc[pub_date_str]
             historical_returns = daily_returns.loc[:pub_date_str].iloc[:-1]
 
             if len(historical_returns) < lookback_days:
-                return False, 0.0
+                return False, 0.0, ""
 
             rolling_std = historical_returns.tail(lookback_days).std()
 
-            if rolling_std == 0:
-                return False, 0.0
+            z_score = pd.Series(0.0, index=day_return.index)
 
-            z_score = abs(day_return) / rolling_std
-            print("zscore is ", z_score)
-            return z_score >= threshold, z_score
+            # Create a boolean mask to find tickers where rolling_std is not 0
+            non_zero_std_mask = rolling_std != 0
+
+            # Perform the z-score calculation only where the rolling_std is not 0
+            z_score.loc[non_zero_std_mask] = abs(day_return) / rolling_std
+
+            # Check against the threshold
+            is_spike = any(z_score >= threshold)
+            return is_spike, z_score.max(), str(z_score.idxmax())
 
         except (KeyError, IndexError, ValueError) as e:
             logger.warning(f"Error calculating volatility for {ticker}: {e}")
-            return False, 0.0
+            return False, 0.0, ""
 
 
 class AsyncOutcomeChecker(ABC):
@@ -553,27 +559,24 @@ class AsyncMarketOutcomeChecker(AsyncOutcomeChecker):
         self, session: aiohttp.ClientSession, text: str, pub_date: datetime
     ) -> Tuple[bool, Optional[str], Optional[int]]:
         """Check for significant market volatility spike."""
-        # Check all sectors concurrently
-        volatility_tasks = [
-            self.market_client.calculate_volatility_spike(ticker, pub_date)
-            for ticker in self.sectors
-        ]
 
-        results = await asyncio.gather(*volatility_tasks, return_exceptions=True)
-
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                logger.warning(
-                    f"Error checking volatility for {self.sectors[i]}: {result}"
+        # Fetch volatility for all sectors in a single asynchronous call
+        try:
+            is_spike, z_score, ticker = (
+                await self.market_client.calculate_volatility_spike(
+                    self.sectors, pub_date
                 )
-                continue
+            )
 
-            is_spike, z_score = result
             if is_spike:
-                ticker = self.sectors[i]
                 info = f"Market volatility spike for {ticker} (Z-score: {z_score:.2f})"
                 logger.info(f"Market spike detected: {info}")
                 return True, info, 1
+
+        except Exception as e:
+            logger.warning(f"Error checking volatility for all sectors: {e}")
+            # In case of an error, we don't consider it a spike
+            return False, None, None
 
         return False, None, None
 
