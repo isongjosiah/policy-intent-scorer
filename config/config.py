@@ -50,6 +50,8 @@ class Settings:
             "1",
             "t",
         )
+        self.LOOKBACK_DAYS: int = int(os.environ.get("LOOKBACK_DAYS", "30"))
 
 
 settings = Settings()
+

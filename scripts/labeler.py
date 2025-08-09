@@ -1,13 +1,9 @@
-import numbers
 import sys
 import os
 import asyncio
 import aiohttp
+import pickle
 from typing import List, Dict, Optional, Tuple, Any
-
-from numpy import roll
-from pandas.core.generic import pprint_thing
-from pandas.core.window import rolling
 
 
 # Add the project root to the Python path
@@ -26,6 +22,7 @@ from collections import Counter
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
+
 
 # Configure logging
 logging.basicConfig(
@@ -383,6 +380,296 @@ class AsyncCongressAPIClient:
             return None
 
 
+class AsyncCachedMarketDataClient:
+    """Async client for market data interactions with local caching."""
+
+    def __init__(
+        self,
+        tickers: List[str],
+        start_date: datetime,
+        end_date: datetime,
+        cache_dir: Optional[str] = None,
+        max_concurrent: int = 3,
+        force_refresh: bool = False,
+    ):
+        """
+        Initialize client and download all required data upfront.
+
+        Args:
+            tickers: List of stock tickers to download
+            start_date: Earliest date needed for analysis
+            end_date: Latest date needed for analysis
+            cache_dir: Directory to store cached data
+            max_concurrent: Max concurrent requests (unused now, kept for compatibility)
+            force_refresh: Force re-download even if cache exists
+        """
+        self.tickers = tickers
+        self.start_date = start_date
+        self.end_date = end_date
+        self.cache_dir = Path(cache_dir) if cache_dir else Path("./market_data_cache")
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.semaphore = asyncio.Semaphore(max_concurrent)
+        self.request_count = 0
+
+        # Cache file path
+        self.cache_file = (
+            self.cache_dir
+            / f"market_data_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.pkl"
+        )
+
+        # Initialize data storage
+        self.data_cache = {}
+
+        # Load or download data
+        asyncio.create_task(self._initialize_data(force_refresh))
+
+    async def _initialize_data(self, force_refresh: bool = False):
+        """Download and cache all required market data."""
+        if not force_refresh and self.cache_file.exists():
+            logger.info(f"Loading cached data from {self.cache_file}")
+            try:
+                with open(self.cache_file, "rb") as f:
+                    self.data_cache = pickle.load(f)
+                logger.info(
+                    f"Loaded data for {len(self.data_cache)} tickers from cache"
+                )
+                return
+            except Exception as e:
+                logger.warning(f"Failed to load cache: {e}. Will re-download data.")
+
+        logger.info(
+            f"Downloading market data for {len(self.tickers)} tickers from {self.start_date} to {self.end_date}"
+        )
+
+        # Download data in batches to avoid overwhelming the API
+        batch_size = 10
+        for i in range(0, len(self.tickers), batch_size):
+            batch_tickers = self.tickers[i : i + batch_size]
+            logger.info(f"Downloading batch {i//batch_size + 1}: {batch_tickers}")
+
+            try:
+                # Run yfinance download in thread pool
+                loop = asyncio.get_event_loop()
+                df = await loop.run_in_executor(
+                    None,
+                    lambda: yf.download(
+                        batch_tickers,
+                        start=self.start_date.strftime("%Y-%m-%d"),
+                        end=self.end_date.strftime("%Y-%m-%d"),
+                        progress=False,
+                        auto_adjust=True,
+                        group_by="ticker" if len(batch_tickers) > 1 else None,
+                    ),
+                )
+
+                if not df.empty:
+                    # Store data for each ticker
+                    if len(batch_tickers) == 1:
+                        # Single ticker case
+                        ticker = batch_tickers[0]
+                        self.data_cache[ticker] = df
+                    else:
+                        # Multiple tickers case
+                        for ticker in batch_tickers:
+                            if ticker in df.columns.get_level_values(0):
+                                self.data_cache[ticker] = df[ticker]
+                            else:
+                                logger.warning(f"No data found for ticker {ticker}")
+                else:
+                    logger.warning(f"No data returned for batch: {batch_tickers}")
+
+                # Add delay between batches to be respectful to the API
+                if i + batch_size < len(self.tickers):
+                    await asyncio.sleep(2)
+
+            except Exception as e:
+                logger.error(f"Error downloading batch {batch_tickers}: {e}")
+
+        # Save cache to disk
+        try:
+            with open(self.cache_file, "wb") as f:
+                pickle.dump(self.data_cache, f)
+            logger.info(f"Cached data saved to {self.cache_file}")
+        except Exception as e:
+            logger.error(f"Failed to save cache: {e}")
+
+        logger.info(
+            f"Data initialization complete. Cached data for {len(self.data_cache)} tickers"
+        )
+
+    async def get_stock_data(
+        self, tickers: List[str], start_date: datetime, end_date: datetime
+    ) -> Optional[pd.DataFrame]:
+        """Fetch stock data from local cache for given tickers and date range."""
+
+        # Wait for initialization to complete if still in progress
+        while not hasattr(self, "data_cache") or not self.data_cache:
+            await asyncio.sleep(0.1)
+
+        try:
+            # If single ticker, return that ticker's data
+            if len(tickers) == 1:
+                ticker = tickers[0]
+                if ticker not in self.data_cache:
+                    logger.warning(f"No cached data found for ticker {ticker}")
+                    return None
+
+                df = self.data_cache[ticker].copy()
+                print("df is")
+                print(df)
+
+                # Filter by date range
+                start_str = start_date.strftime("%Y-%m-%d")
+                end_str = end_date.strftime("%Y-%m-%d")
+
+                # Filter the dataframe by date range
+                mask = (df.index >= start_str) & (df.index <= end_str)
+                filtered_df = df.loc[mask]
+                print("df is")
+                print(filtered_df)
+
+                if filtered_df.empty:
+                    logger.warning(
+                        f"No data found for ticker {ticker} in date range {start_str} to {end_str}"
+                    )
+                    return None
+
+                return filtered_df
+
+            else:
+                # Multiple tickers - combine data
+                combined_data = {}
+                start_str = start_date.strftime("%Y-%m-%d")
+                end_str = end_date.strftime("%Y-%m-%d")
+
+                for ticker in tickers:
+                    if ticker not in self.data_cache:
+                        logger.warning(f"No cached data found for ticker {ticker}")
+                        continue
+
+                    df = self.data_cache[ticker].copy()
+
+                    # Filter by date range
+                    mask = (df.index >= start_str) & (df.index <= end_str)
+                    filtered_df = df.loc[mask]
+
+                    if not filtered_df.empty:
+                        combined_data[ticker] = filtered_df
+
+                if not combined_data:
+                    logger.warning(f"No data found for any tickers in date range")
+                    return None
+
+                # Create multi-level column structure similar to yfinance
+                result = pd.concat(combined_data, axis=1, names=["Ticker", "Price"])
+
+                # Reorder columns to match yfinance format (Price, Ticker)
+                if len(tickers) > 1:
+                    result = result.swaplevel(0, 1, axis=1).sort_index(axis=1)
+
+                return result
+
+        except Exception as e:
+            logger.error(f"Error retrieving cached data for {tickers}: {e}")
+            return None
+
+    async def calculate_volatility_spike(
+        self,
+        tickers: List[str],
+        pub_date: datetime,
+        lookback_days: int = settings.LOOKBACK_DAYS,
+        threshold: float = 2.0,
+    ) -> Tuple[bool, float, str]:
+        """Calculate if there was a significant volatility spike."""
+
+        start_date = pub_date - timedelta(days=lookback_days)
+        end_date = pub_date + timedelta(days=0)
+
+        df = await self.get_stock_data(tickers, start_date, end_date)
+        if df is None:
+            return False, 0.0, ""
+
+        if df is None:
+            return False, 0.0, ""
+
+        try:
+            # Handle both single and multiple ticker cases
+            if len(tickers) == 1:
+                close_prices = df["Close"]
+            else:
+                close_prices = (
+                    df["Close"]
+                    if "Close" in df.columns
+                    else df.xs("Close", level=1, axis=1)
+                )
+
+            daily_returns = close_prices.pct_change(fill_method=None).fillna(0)
+
+            pub_date_str = pub_date.strftime("%Y-%m-%d")
+            if pub_date_str not in daily_returns.index:
+                available_dates = daily_returns.index[
+                    daily_returns.index >= pub_date_str
+                ]
+                if len(available_dates) == 0:
+                    return False, 0.0, ""
+                pub_date_str = available_dates[0]
+
+            day_return = daily_returns.loc[pub_date_str]
+            historical_returns = daily_returns.loc[:pub_date_str].iloc[:-1]
+
+            rolling_std = historical_returns.tail(lookback_days).std()
+
+            z_score = pd.Series(
+                0.0, index=day_return.index if hasattr(day_return, "index") else [0]
+            )
+
+            # Create a boolean mask to find tickers where rolling_std is not 0
+            non_zero_std_mask = rolling_std != 0
+
+            # Perform the z-score calculation only where the rolling_std is not 0
+            z_score.loc[non_zero_std_mask] = abs(day_return) / rolling_std
+
+            # Check against the threshold
+            is_spike = (
+                any(z_score >= threshold)
+                if hasattr(z_score, "__iter__")
+                else z_score >= threshold
+            )
+            max_z = z_score.max() if hasattr(z_score, "max") else z_score
+            max_ticker = (
+                str(z_score.idxmax()) if hasattr(z_score, "idxmax") else tickers[0]
+            )
+
+            return is_spike, max_z, max_ticker
+
+        except (KeyError, IndexError, ValueError) as e:
+            logger.warning(f"Error calculating volatility for {tickers}: {e}")
+            return False, 0.0, ""
+
+    def clear_cache(self):
+        """Clear the cached data file."""
+        if self.cache_file.exists():
+            self.cache_file.unlink()
+            logger.info(f"Cleared cache file: {self.cache_file}")
+
+        self.data_cache = {}
+
+    def get_cache_info(self):
+        """Get information about cached data."""
+        if not self.data_cache:
+            return "No data cached"
+
+        info = {
+            "tickers_count": len(self.data_cache),
+            "tickers": list(self.data_cache.keys()),
+            "date_range": f"{self.start_date.strftime('%Y-%m-%d')} to {self.end_date.strftime('%Y-%m-%d')}",
+            "cache_file": str(self.cache_file),
+            "cache_file_exists": self.cache_file.exists(),
+        }
+
+        return info
+
+
 class AsyncMarketDataClient:
     """Async client for market data interactions."""
 
@@ -391,6 +678,7 @@ class AsyncMarketDataClient:
         if self.cache_dir:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.semaphore = asyncio.Semaphore(max_concurrent)
+        self.request_count = 0
 
     async def get_stock_data(
         self, tickers: List[str], start_date: datetime, end_date: datetime
@@ -410,22 +698,35 @@ class AsyncMarketDataClient:
                         auto_adjust=True,
                     ),
                 )
+                self.request_count += 1
 
                 if df.empty:
-                    logger.warning(f"No data found for ticker {ticker}")
+                    logger.warning(f"No data found for ticker {tickers}")
                     return None
 
                 return df
 
             except Exception as e:
-                logger.warning(f"Error fetching market data for {ticker}: {e}")
+                logger.warning(f"Error fetching market data for {tickers}: {e}")
                 return None
+            finally:
+                # Check if the counter has reached 100 and apply a longer delay
+                if self.request_count % 90 == 0 and self.request_count > 0:
+                    logger.info(
+                        f"Made {self.request_count} requests. Pausing for a longer delay."
+                    )
+                    await asyncio.sleep(
+                        60
+                    )  # Pause for 60 seconds after every 100 requests
+                else:
+                    # Regular, short delay to prevent a flood of requests
+                    await asyncio.sleep(1)
 
     async def calculate_volatility_spike(
         self,
         tickers: List[str],
         pub_date: datetime,
-        lookback_days: int = 30,
+        lookback_days: int = settings.LOOKBACK_DAYS,
         threshold: float = 2.0,
     ) -> Tuple[bool, float, str]:
         """Calculate if there was a significant volatility spike."""
@@ -525,6 +826,8 @@ class AsyncCongressOutcomeChecker(AsyncOutcomeChecker):
                 await self._get_congress_number_from_date(pub_date),
             )
             for numbers in bill_numbers
+            if numbers[0].lower().replace(".", "")
+            in ["hr", "s", "hjres", "sjres", "hconres", "sconres", "hres", "sres"]
         ]
 
         all_bills_results = await asyncio.gather(
@@ -551,7 +854,7 @@ class AsyncCongressOutcomeChecker(AsyncOutcomeChecker):
 class AsyncMarketOutcomeChecker(AsyncOutcomeChecker):
     """Checks for market volatility outcomes."""
 
-    def __init__(self, market_client: AsyncMarketDataClient, sectors: List[str]):
+    def __init__(self, market_client: AsyncCachedMarketDataClient, sectors: List[str]):
         self.market_client = market_client
         self.sectors = sectors
 
@@ -752,7 +1055,7 @@ class AsyncDataProcessor:
 
 
 def create_async_labeling_service(
-    config: Dict[str, Any],
+    config: Dict[str, Any], start: datetime, end: datetime
 ) -> AsyncPressReleaseLabelingService:
     """Factory function to create async labeling service from configuration."""
     keyword_extractor = AsyncKeywordExtractor()
@@ -768,7 +1071,9 @@ def create_async_labeling_service(
 
     # Market checker
     if config.get("market_sectors"):
-        market_client = AsyncMarketDataClient()
+        market_client = AsyncCachedMarketDataClient(
+            tickers=settings.MARKET_SECTORS, start_date=start, end_date=end
+        )
         market_checker = AsyncMarketOutcomeChecker(
             market_client, config["market_sectors"]
         )
@@ -791,12 +1096,13 @@ async def main():
         return
 
     # Initialize services
-    labeling_service = create_async_labeling_service(config)
     data_processor = AsyncDataProcessor()
 
     # Load data
-    # df_raw: pd.DataFrame = await data_processor.load_from_local(config["input_file"])
-    df_raw: pd.DataFrame = pd.DataFrame()
+    df_raw: pd.DataFrame = await data_processor.load_from_local(config["input_file"])
+    start: datetime = df_raw["date"].min() - timedelta(days=35)
+    end: datetime = df_raw["date"].max() + timedelta(days=1)
+    labeling_service = create_async_labeling_service(config, start=start, end=end)
     if df_raw.empty:
         logger.warning("No input data found. Creating sample data for testing.")
         sample_data = [
@@ -835,9 +1141,6 @@ async def main():
     start_time = datetime.now()
 
     labeled_results = await labeling_service.process_batch(data_batch, batch_size=10)
-    print("labelled result")
-    __import__("pprint").pprint(labeled_results)
-
     end_time = datetime.now()
     logger.info(
         f"Completed processing in {(end_time - start_time).total_seconds():.2f} seconds"
