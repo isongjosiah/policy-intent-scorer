@@ -1,8 +1,10 @@
+import numbers
 import sys
 import os
 import asyncio
 import aiohttp
 from typing import List, Dict, Optional, Tuple, Any
+
 
 # Add the project root to the Python path
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -12,7 +14,7 @@ if project_root not in sys.path:
 from config.config import settings
 import yfinance as yf
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import timezone, datetime, timedelta
 import re
 import math
 import logging
@@ -177,6 +179,42 @@ class AsyncKeywordExtractor:
         ]
         return words
 
+    def _split_sentences_with_abbreviations(self, text: str) -> List[str]:
+        """
+        Splits text into sentences, but first protects abbreviations to prevent
+        them from being split incorrectly.
+        """
+        # 1. Define a list of abbreviations to protect.
+        # Add more as needed, e.g., 'etc.', 'e.g.', 'vs.'
+        abbreviations = ["H.R.", "S.", "A.M.", "P.M.", "Dr.", "Mr.", "Mrs.", "Ms."]
+
+        # 2. Create a regex pattern to find these abbreviations.
+        # We use a word boundary (\b) to ensure we match the full word.
+        abbr_pattern = "|".join(
+            map(re.escape, sorted(abbreviations, key=len, reverse=True))
+        )
+
+        # 3. Create a unique placeholder to temporarily replace the abbreviations.
+        placeholder = "__ABBR_PLACEHOLDER__"
+
+        # 4. Temporarily replace the abbreviations with the placeholder.
+        # This prevents the primary split from breaking up H.R. etc.
+        text_with_placeholders = re.sub(
+            r"\b(" + abbr_pattern + r")",
+            lambda m: m.group(0).replace(".", placeholder),
+            text,
+        )
+
+        # 5. Split the text into sentences using the standard punctuation.
+        sentences = re.split(r"[.!?]+", text_with_placeholders)
+
+        # 6. Replace the placeholder back with a period in the resulting sentences.
+        cleaned_sentences = [
+            s.replace(placeholder, ".") for s in sentences if s.strip()
+        ]
+
+        return cleaned_sentences
+
     async def extract_by_frequency(
         self, text: str, top_k: int = 10
     ) -> List[Tuple[str, int]]:
@@ -190,7 +228,7 @@ class AsyncKeywordExtractor:
         self, text: str, top_k: int = 10
     ) -> List[Tuple[str, float]]:
         """Extract keywords using TF-IDF scoring."""
-        sentences = [s.strip() for s in re.split(r"[.!?]+", text.strip()) if s.strip()]
+        sentences = self._split_sentences_with_abbreviations(text)
 
         if len(sentences) < 2:
             freq_results = await self.extract_by_frequency(text, top_k)
@@ -277,17 +315,20 @@ class AsyncCongressAPIClient:
     async def search_bills(
         self,
         session: aiohttp.ClientSession,
-        query: str,
+        bill_type: str,
+        bill_number: str,
+        congress: str,
         limit: int = 20,
         offset: int = 0,
         sort: str = "relevance",
-    ) -> List[Bill]:
+    ) -> Optional[Bill]:
         """Search for bills using the Congress.gov API."""
         async with self.semaphore:  # Limit concurrent requests
+            bill: Optional[Bill] = None
             try:
-                url = f"{self.base_url}/bill"
+                url = f"{self.base_url}/bill/{congress}/{bill_type}/{bill_number}"
                 params = {
-                    "query": query,
+                    "query": "",
                     "api_key": self.api_key,
                     "limit": limit,
                     "offset": offset,
@@ -300,33 +341,40 @@ class AsyncCongressAPIClient:
                 ) as response:
                     response.raise_for_status()
                     data = await response.json()
+                    bill_data = data.get("bill")
 
-                    bills = []
-                    for item in data.get("bills", []):
-                        bills.append(
-                            Bill(
-                                title=item.get("title"),
-                                url=item.get("url"),
-                                latest_action_date=self._to_datetime(
-                                    item.get("latestAction", {}).get("actionDate")
-                                ),
-                                status=item.get("status"),
-                            )
-                        )
-                    return bills
+                    bill = Bill(
+                        title=bill_data.get("title"),
+                        url="",
+                        latest_action_date=self._to_datetime(
+                            bill_data.get("latestAction", {}).get("actionDate", "")
+                        ),
+                        status=(
+                            "Became Law"
+                            if len(bill_data.get("laws", [])) > 0
+                            else "Not Law"
+                        ),
+                    )
+                    return bill
 
             except aiohttp.ClientError as e:
-                logger.error(f"HTTP error searching Congress API for '{query}': {e}")
-                return []
+                logger.error(
+                    f"HTTP error searching Congress API for '{bill_type}/{bill_number}': {e}"
+                )
+                return bill
             except (ValueError, KeyError) as e:
-                logger.error(f"Error parsing Congress API response for '{query}': {e}")
-                return []
+                logger.error(
+                    f"Error parsing Congress API response for '{bill_type}/{bill_number}': {e}"
+                )
+                return bill
 
     def _to_datetime(self, date_str: Optional[str]) -> Optional[datetime]:
         if not date_str:
             return None
         try:
-            return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+            return datetime.fromisoformat(date_str.replace("Z", "+00:00")).replace(
+                tzinfo=timezone(timedelta(hours=-4))
+            )
         except (ValueError, TypeError):
             return None
 
@@ -341,7 +389,7 @@ class AsyncMarketDataClient:
         self.semaphore = asyncio.Semaphore(max_concurrent)
 
     async def get_stock_data(
-        self, ticker: str, start_date: datetime, end_date: datetime
+        self, ticker: List[str], start_date: datetime, end_date: datetime
     ) -> Optional[pd.DataFrame]:
         """Fetch stock data for a given ticker and date range."""
         async with self.semaphore:  # Limit concurrent requests
@@ -371,7 +419,7 @@ class AsyncMarketDataClient:
 
     async def calculate_volatility_spike(
         self,
-        ticker: str,
+        ticker: List[str],
         pub_date: datetime,
         lookback_days: int = 30,
         threshold: float = 2.0,
@@ -386,9 +434,12 @@ class AsyncMarketDataClient:
         df = await self.get_stock_data(ticker, start_date, end_date)
         if df is None or len(df) < lookback_days:
             return False, 0.0
+        print(f"stock data|{ticker}")
+        print(df)
 
         try:
-            daily_returns = df["Close"].pct_change().dropna()
+            daily_returns = df["Close"].pct_change(fill_method=None).dropna()
+            print("daily returns", daily_returns)
 
             if len(daily_returns) < lookback_days:
                 return False, 0.0
@@ -414,6 +465,7 @@ class AsyncMarketDataClient:
                 return False, 0.0
 
             z_score = abs(day_return) / rolling_std
+            print("zscore is ", z_score)
             return z_score >= threshold, z_score
 
         except (KeyError, IndexError, ValueError) as e:
@@ -443,48 +495,49 @@ class AsyncCongressOutcomeChecker(AsyncOutcomeChecker):
         self.congress_client = congress_client
         self.keyword_extractor = keyword_extractor
 
-    async def _extract_policy_keywords(
-        self, text: str, max_keywords: int = 5
-    ) -> List[str]:
+    async def _extract_bill_numbers(self, text: str) -> List[str]:
         """Extract relevant policy keywords from text."""
-        keywords = await self.keyword_extractor.extract_by_tfidf(text, max_keywords * 2)
+        # NOTE: at this point, the thing of importance to us is the bill numbers
+        bill_regex_pattern = r"(\b(?:[a-zA-Z]+\.)+)\s?(\d+\b)"
+        return list(set(re.findall(bill_regex_pattern, text)))
 
-        policy_terms = []
-        for word, score in keywords:
-            if (
-                len(word) > 3
-                and word not in ["president", "administration", "government", "federal"]
-                and not word.isdigit()
-            ):
-                policy_terms.append(word)
-
-        return policy_terms[:max_keywords]
+    async def _get_congress_number_from_date(self, pub_date: datetime) -> str:
+        return str(int(((pub_date.year - 1789) / 2) + 1))
 
     async def check_outcome(
         self, session: aiohttp.ClientSession, text: str, pub_date: datetime
     ) -> Tuple[bool, Optional[str], Optional[int]]:
         """Check if related legislation became law within 180 days."""
-        search_terms = await self._extract_policy_keywords(text)
+        bill_numbers = await self._extract_bill_numbers(text)
 
         # Search for bills concurrently
         bill_search_tasks = [
-            self.congress_client.search_bills(session, term) for term in search_terms
+            self.congress_client.search_bills(
+                session,
+                numbers[0].lower().replace(".", ""),
+                numbers[1],
+                await self._get_congress_number_from_date(pub_date),
+            )
+            for numbers in bill_numbers
         ]
 
         all_bills_results = await asyncio.gather(
             *bill_search_tasks, return_exceptions=True
         )
 
-        for bills_result in all_bills_results:
-            if isinstance(bills_result, Exception):
-                logger.warning(f"Error in bill search: {bills_result}")
+        for bill_result in all_bills_results:
+            if isinstance(bill_result, Exception):
+                logger.warning(f"Error in bill search: {bill_result}")
                 continue
 
-            for bill in bills_result:
-                if bill.status == "Became Law" and bill.latest_action_date:
-                    days_diff = (bill.latest_action_date - pub_date).days
-                    if 0 < days_diff <= 180:
-                        return True, bill.url, days_diff
+            if bill_result is None:
+                logger.warning(f"Error in bill search: {bill_result}")
+                continue
+
+            if bill_result.status == "Became Law" and bill_result.latest_action_date:
+                days_diff = (bill_result.latest_action_date - pub_date).days
+                if days_diff <= 180:
+                    return True, bill_result.url, days_diff
 
         return False, None, None
 
@@ -739,15 +792,35 @@ async def main():
     data_processor = AsyncDataProcessor()
 
     # Load data
-    df_raw = await data_processor.load_from_local(config["input_file"])
+    # df_raw: pd.DataFrame = await data_processor.load_from_local(config["input_file"])
+    df_raw: pd.DataFrame = pd.DataFrame()
     if df_raw.empty:
         logger.warning("No input data found. Creating sample data for testing.")
         sample_data = [
             {
-                "headline": "President Announces New Climate Initiative",
-                "content": "The President is proud to announce a bold new climate initiative...",
-                "date": "2025-01-01",
-            }
+                "content": "Office of the First Lady\t\t\t\t\n\n\t\t\t\t\tFirst Lady Melania Trump Celebrates Committee Passage of Take It Down Act in House Energy & Commerce\t\t\t\t\n\n\n\n\tThe White House\n\n\nApril 9, 2025 \n\n\n\n\nWASHINGTON, D.C. – First Lady Melania Trump celebrated committee passage of H.R. 633, the Take It Down Act, in the House of Representatives Committee on Energy and Commerce on Tuesday, April 8, 2025. The bill advanced with broad bipartisan support.\nIn an official statement shared with the House Energy and Commerce Committee and on social media, the First Lady said, “I remain dedicated to championing child well-being, ensuring that every young person can thrive and ‘Be Best.’ Thank you to the House Energy & Commerce Committee for advancing the Take It Down Act. This marks a significant step in our bipartisan efforts to safeguard our children from online threats. I urge Congress to swiftly pass this important legislation. Together, we can create a safer, brighter future for all Americans!”\nThe Take It Down Act would protect children who are targeted by the publication of non-consensual intimate imagery (NCII) online, require internet platforms—including social media platforms—to remove such imagery within 48 hours of notice from a victim, and provide justice for survivors by criminalizing the publication of, or threat to publish, NCII.Read the House Energy and Commerce Committee press release here or below.\n\nApril 8, 2025\nChairman Guthrie, First Lady Melania Trump, Chairman Bilirakis Join Advocates in Celebrating Committee Passage of TAKE IT DOWN Act\nWASHINGTON, D.C. – Today, Congressman Brett Guthrie (KY-02), Chairman of the House Committee on Energy and Commerce, along with advocates for the TAKE IT DOWN Act, issued the following statements of support after the bill was reported out of Committee by a vote of 49 to 1.\n“No man, woman, or child should be subjected to the spread of explicit AI images meant to target and harass innocent victims. I am so thankful for our outstanding advocates and legislators who have worked hard to raise awareness and build a strong coalition to support this bipartisan bill,” said Chairman Guthrie. “Today, the Committee on Energy and Commerce advanced the bill to the full House of Representatives, where I look forward to, once again, voting in favor of the TAKE IT DOWN Act, so that we can send it to the President’s desk for signature.”\n“I remain dedicated to championing child well-being, ensuring that every young person can thrive and ‘Be Best.’ Thank you to the House Energy & Commerce Committee for advancing the TAKE IT DOWN Act. This marks a significant step in our bipartisan efforts to safeguard our children from online threats,” said First Lady Melania Trump. “I urge Congress to swiftly pass this important legislation. Together, we can create a safer, brighter future for all Americans!”\n“I am glad we are one step closer to protecting victims of online sexual exploitation. Giving victims rights to flag non-consensual images and requiring social media companies to remove that content quickly is a pivotal and necessary change to the online landscape,” said Congressman Gus Bilirakis (FL-12), Chairman of the Subcommittee on Commerce, Manufacturing, and Trade. “And by ensuring that AI-generated deep-fake content is included in these protections, Congress is showing its commitment to fighting 21st Century harms that are plaguing our children and grandchildren.”\n“In February, our family mourned the loss of our loving son and brother, Elijah Heacock, after he fell victim to an extortion scheme on the internet,” said Shannon Cronister-Heacock, mother of Elijah Heacock. “We are grateful for the support of Chairman Guthrie and the House Committee on Energy and Commerce for passing the TAKE IT DOWN Act today to ensure that no parent, sibling, or loved one experiences a similar tragedy in the future. This bill honors Elijah’s life, and we are appreciative of Congress’ actions to protect children online and save lives.”\n“I was only fourteen years old when one of my classmates created deepfake, AI nudes of me and distributed them on social media. I was shocked, violated, and felt unsafe going to school. Thankfully, I was able to work with Senator Ted Cruz’s office to write the TAKE IT DOWN Act — and today is an important milestone towards that bill becoming law, so that no other girl has to go through what I went through without legal protections in place,” said Elliston Berry, survivor and advocate. “Thank you to Chairman Guthrie for prioritizing the TAKE IT DOWN Act for committee passage.”\n“At 14, for almost two years, I stood alone, advocating for AI deep fake laws to protect us after my school’s inaction and lack of accountability insulted my self-respect. This journey is dedicated to every woman and teenager who was told to stay silent and move on. It is also a testament to the courageous bipartisan leaders who stood beside me, proving that change is possible. Today, we celebrate a critical step towards the passage of the TAKE IT DOWN Act into federal law,” said Francesca Mani, AI victim turned advocate & TIME100 AI Most Influential Person. “A heartfelt thank you to Chairman Guthrie for standing with us and making swift committee passage possible. We are no longer alone.”\n“Today, we celebrate an important victory with House committee passage of the TAKE IT DOWN Act, a federal safeguard against non-consensual AI-generated intimate images,” said Dorota Mani, an educator, advocate, and mother. “This important legislation, which is now well on its way to the President’s desk, staunchly defends our women and children while preserving every American’s dignity and rights.” “Survivors—both minors and adults—deserve protection and justice. Every survivor should be able to report their abuse to law enforcement, have their abuse content removed fully and abusers should be found and held appropriately accountable. Image-based sexual abuse is sexual assault facilitated online. You cannot accidentally sexual assault someone offline and the same should be true for the online. The harms of all forms of image-based sexual abuse—including deepfake abuse—quickly follow that victim home, to school, to work and anywhere they try to exist after such a profound and public trauma,” said Andrea Powell, Co-Founder and Chief of Impact, Alecto AI. “Alecto AI supports the TAKE IT DOWN Act because we believe that in its passage, we will be getting closer to a world where young women and girls don’t have worry that being online means being targets of sexual violence. All survivors deserve protection and justice.”",
+                "headline": "First Lady Melania Trump Celebrates Committee Passage of Take It Down Act in House Energy & Commerce",
+                "link": "https://www.whitehouse.gov/briefings-statements/2025/04/first-lady-melania-trump-celebrates-committee-passage-of-take-it-down-act-in-house-energy-commerce/",
+                "date": "2025-04-09T15:00:00-04:00",
+            },
+            {
+                "content": "STATEMENT OF ADMINISTRATION POLICY H.R. 21 – Born-Alive Abortion Survivors Protection Act \t\t\t\t\n\n\n\n\tThe White House\n\n\nJanuary 23, 2025 \n\n\n\n\nEXECUTIVE OFFICE OF THE PRESIDENTOFFICE OF MANAGEMENT AND BUDGETWASHINGTON, D.C. 20503January 23, 2025(House)\nSTATEMENT OF ADMINISTRATION POLICY\nH.R. 21 – Born-Alive Abortion Survivors Protection Act(Rep. Ann Wagner, R-MO-2, and 151 cosponsors)\nThe Administration strongly supports H.R. 21 the Born-Alive Abortion Survivors Protection Act, and applauds the House for its efforts to protect the most vulnerable and prevent infanticide.\nCurrent law fails to provide adequate protections, including adequate requirements for the provision of medical care, for vulnerable newborns who survive an abortion attempt. If enacted, H.R. 21 would require any healthcare practitioner who is present at the time that such a child is born to exercise care to preserve the child’s life and health, and to ensure the child is immediately transported and admitted to a hospital. The bill would also require a healthcare practitioner, or hospital employee, to immediately report a violation of these requirements. H.R. 21 would establish a civil right of action for, and prevent criminal prosecution and penalties from being brought against, the mothers of such children.\nAs President Trump established through Executive Order 13952 of September 25, 2020, it is the policy of the United States to recognize the human dignity and inherent worth of every newborn or other infant child, regardless of prematurity or disability, and to ensure for each child due protection under the law.\nA baby that survives an abortion and is born alive into this world should be treated just like any other baby born alive. H.R. 21 would properly amend current law to ensure that the life of one baby is not treated as being more or less valuable than another.\nIf H.R. 21 were presented to the President in its current form, his advisors would recommend he sign it into law.",
+                "headline": "Statement of Administration Policy H.R. 21 – Born-Alive Abortion Survivors Protection Act",
+                "link": "https://www.whitehouse.gov/briefings-statements/2025/01/statement-of-administration-policy-h-r-21-born-alive-abortion-survivors-protection-act/",
+                "date": "2025-01-23T15:54:10-05:00",
+            },
+            {
+                "content": "H.R. 1815 Signed into Law\t\t\t\t\n\n\n\n\tThe White House\n\n\nJuly 30, 2025 \n\n\n\n\nOn Wednesday, July 30, 2025, the President signed into law: H.R. 1815, “VA Home Loan Program Reform Act”, which amends title 38, United States Code, to authorize the Secretary of Veterans Affairs to take certain actions in the case of a default on a home loan guaranteed by the Secretary, and for other purposes.",
+                "headline": "H.R. 1815 Signed into Law",
+                "link": "https://www.whitehouse.gov/briefings-statements/2025/07/h-r-1815-signed-into-law/",
+                "date": "2025-07-30T14:48:31-04:00",
+            },
+            {
+                "content": "H.R. 4 and H.R. 517 Signed into Law S. 1582\t\t\t\t\n\n\n\n\tThe White House\n\n\nJuly 24, 2025 \n\n\n\n\nOn Thursday, July 24, 2025, the President signed into law: H.R. 4, the “Rescissions Act of 2025,” which rescinds certain budget authority proposed to be rescinded in special messages transmitted to the Congress by the President on June 3, 2025, in accordance with section 1012(a) of the Congressional Budget and Impoundment Control Act of 1974; H.R. 517, the “Filing Relief for Natural Disasters Act,” which amends the Internal Revenue Code of 1986 to modify the rules for postponing certain deadlines by reason of disaster; and S. 1596, the “Jocelyn Nungaray National Wildlife Refuge Act,” which renames the Anahuac National Wildlife Refuge located in the State of Texas as the “Jocelyn Nungaray National Wildlife Refuge”.",
+                "headline": "H.R. 4 and H.R. 517 Signed into Law S. 1582",
+                "link": "https://www.whitehouse.gov/briefings-statements/2025/07/h-r-4-and-h-r-517-signed-into-law-s-1582/",
+                "date": "2025-07-24T17:59:40-04:00",
+            },
         ]
         df_raw = pd.DataFrame(sample_data)
 
@@ -759,6 +832,8 @@ async def main():
     start_time = datetime.now()
 
     labeled_results = await labeling_service.process_batch(data_batch, batch_size=10)
+    print("labelled result")
+    __import__("pprint").pprint(labeled_results)
 
     end_time = datetime.now()
     logger.info(

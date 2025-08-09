@@ -21,7 +21,7 @@ dependencies = [
     "aiohttp (>=3.12.15,<4.0.0)",
     "dotenv (>=0.9.9,<0.10.0)",
     "redis (>=6.4.0,<7.0.0)",
-    "fastapi-limiter (>=0.1.6,<0.2.0)"
+    "fastapi-limiter (>=0.1.6,<0.2.0)",
 ]
 
 [tool.poetry]
