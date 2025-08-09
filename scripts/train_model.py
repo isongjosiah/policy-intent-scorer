@@ -23,6 +23,35 @@ from abc import ABC, abstractmethod
 from typing import Dict, Any, Optional, Union
 import logging
 
+import pandas as pd
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import SVC
+from sklearn.pipeline import Pipeline
+from sklearn.model_selection import (
+    train_test_split,
+    cross_val_score,
+    GridSearchCV,
+    StratifiedKFold,
+)
+from sklearn.metrics import (
+    roc_auc_score,
+    classification_report,
+    confusion_matrix,
+    precision_recall_curve,
+    f1_score,
+)
+from sklearn.preprocessing import StandardScaler
+from sklearn.feature_selection import SelectKBest, chi2
+from sklearn.compose import ColumnTransformer
+from sklearn.base import BaseEstimator, TransformerMixin
+import re
+import logging
+from typing import Dict, Any, Optional, List, Tuple
+from abc import ABC, abstractmethod
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -78,6 +107,7 @@ class LocalParquetDataLoader(DataLoader):
                 df = pd.read_parquet(file_path)
 
             logger.info(f"Successfully loaded {len(df)} records from {file_path}")
+            print(df.columns)
             return df
 
         except Exception as e:
@@ -204,6 +234,535 @@ class S3ModelSaver(ModelSaver):
         except Exception as e:
             logger.error(f"Error saving model to S3: {str(e)}")
             return False
+
+
+class TextFeatureEngineer(BaseEstimator, TransformerMixin):
+    """Custom transformer for advanced text feature engineering."""
+
+    def __init__(self):
+        self.feature_names_ = []
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        """Extract additional text features."""
+        features = []
+        feature_names = []
+
+        for text in X:
+            text_str = str(text)
+
+            # Length features
+            char_count = len(text_str)
+            word_count = len(text_str.split())
+            sentence_count = len(text_str.split("."))
+
+            # Punctuation features
+            exclamation_count = text_str.count("!")
+            question_count = text_str.count("?")
+
+            # Uppercase features
+            upper_ratio = sum(1 for c in text_str if c.isupper()) / max(
+                len(text_str), 1
+            )
+
+            # Financial/action keywords
+            financial_keywords = [
+                "billion",
+                "million",
+                "budget",
+                "fund",
+                "tax",
+                "spending",
+            ]
+            action_keywords = [
+                "will",
+                "shall",
+                "must",
+                "require",
+                "implement",
+                "establish",
+            ]
+            urgent_keywords = ["immediately", "urgent", "crisis", "emergency"]
+
+            financial_count = sum(
+                1 for word in financial_keywords if word.lower() in text_str.lower()
+            )
+            action_count = sum(
+                1 for word in action_keywords if word.lower() in text_str.lower()
+            )
+            urgent_count = sum(
+                1 for word in urgent_keywords if word.lower() in text_str.lower()
+            )
+
+            # Combine features
+            row_features = [
+                char_count,
+                word_count,
+                sentence_count,
+                exclamation_count,
+                question_count,
+                upper_ratio,
+                financial_count,
+                action_count,
+                urgent_count,
+            ]
+
+            features.append(row_features)
+
+        self.feature_names_ = [
+            "char_count",
+            "word_count",
+            "sentence_count",
+            "exclamation_count",
+            "question_count",
+            "upper_ratio",
+            "financial_count",
+            "action_count",
+            "urgent_count",
+        ]
+
+        return np.array(features)
+
+    def get_feature_names_out(self, input_features=None):
+        return self.feature_names_
+
+
+class ModelTrainer(ABC):
+    @abstractmethod
+    def train_and_validate(self, df: pd.DataFrame) -> Optional[Any]:
+        pass
+
+
+class ImprovedSklearnTextClassifierTrainer(ModelTrainer):
+    """Enhanced trainer with cross-validation, hyperparameter tuning, and feature engineering."""
+
+    def __init__(
+        self,
+        target_roc_auc: float = 0.7,
+        max_features: int = 10000,
+        test_size: float = 0.2,
+        random_state: int = 42,
+        cv_folds: int = 5,
+        use_hyperparameter_tuning: bool = True,
+        use_feature_selection: bool = True,
+        use_ensemble: bool = False,
+    ):
+        self.target_roc_auc = target_roc_auc
+        self.test_size = test_size
+        self.random_state = random_state
+        self.cv_folds = cv_folds
+        self.use_hyperparameter_tuning = use_hyperparameter_tuning
+        self.use_feature_selection = use_feature_selection
+        self.use_ensemble = use_ensemble
+        self.max_features = max_features
+
+        self.best_model = None
+        self.best_score = 0
+        self.feature_importance = None
+
+    def _create_base_pipeline(self, classifier_name: str = "logistic") -> Pipeline:
+        """Create a base pipeline with advanced feature engineering."""
+
+        steps = []
+
+        # Text preprocessing and vectorization
+        if self.use_feature_selection:
+            steps.extend(
+                [
+                    (
+                        "tfidf",
+                        TfidfVectorizer(
+                            max_features=self.max_features,
+                            stop_words="english",
+                            ngram_range=(1, 3),  # Include trigrams
+                            min_df=2,
+                            max_df=0.95,  # Remove very common words
+                            sublinear_tf=True,  # Use sublinear tf scaling
+                        ),
+                    ),
+                    (
+                        "feature_selection",
+                        SelectKBest(chi2, k=min(5000, self.max_features)),
+                    ),
+                ]
+            )
+        else:
+            steps.append(
+                (
+                    "tfidf",
+                    TfidfVectorizer(
+                        max_features=self.max_features,
+                        stop_words="english",
+                        ngram_range=(1, 3),
+                        min_df=2,
+                        max_df=0.95,
+                        sublinear_tf=True,
+                    ),
+                )
+            )
+
+        # Classifier
+        if classifier_name == "logistic":
+            classifier = LogisticRegression(
+                solver="liblinear",
+                random_state=self.random_state,
+                max_iter=2000,
+                class_weight="balanced",  # Handle class imbalance
+            )
+        elif classifier_name == "svm":
+            classifier = SVC(
+                probability=True,
+                random_state=self.random_state,
+                class_weight="balanced",
+            )
+        elif classifier_name == "rf":
+            classifier = RandomForestClassifier(
+                random_state=self.random_state,
+                class_weight="balanced",
+                n_estimators=100,
+            )
+        else:
+            raise ValueError(f"Unknown classifier: {classifier_name}")
+
+        steps.append(("classifier", classifier))
+
+        return Pipeline(steps)
+
+    def _get_hyperparameter_grids(self) -> Dict[str, Dict]:
+        """Define hyperparameter grids for different models."""
+        return {
+            "logistic": {
+                "tfidf__max_features": [5000, 10000, 15000],
+                "tfidf__ngram_range": [(1, 2), (1, 3)],
+                "classifier__C": [0.1, 1.0, 10.0],
+                "classifier__penalty": ["l1", "l2"],
+            },
+            "svm": {
+                "tfidf__max_features": [5000, 10000],
+                "tfidf__ngram_range": [(1, 2), (1, 3)],
+                "classifier__C": [0.1, 1.0, 10.0],
+                "classifier__kernel": ["rbf", "linear"],
+            },
+            "rf": {
+                "tfidf__max_features": [5000, 10000],
+                "tfidf__ngram_range": [(1, 2), (1, 3)],
+                "classifier__n_estimators": [100, 200],
+                "classifier__max_depth": [10, 20, None],
+            },
+        }
+
+    def _validate_data(self, df: pd.DataFrame) -> bool:
+        """Validate input data."""
+        required_columns = ["headline", "body", "label_t180"]
+        missing_columns = [col for col in required_columns if col not in df.columns]
+
+        if missing_columns:
+            logger.error(f"Missing required columns: {missing_columns}")
+            return False
+
+        if len(df) < 10:  # Minimum for cross-validation
+            logger.error(
+                f"Insufficient data: {len(df)} samples. Need at least 10 samples for cross-validation."
+            )
+            return False
+
+        return True
+
+    def _prepare_features(self, df: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
+        """Prepare features and target variables."""
+        df = df.copy()
+
+        # Combine headline and body with better formatting
+        df["text"] = (
+            df["headline"].fillna("") + ". " + df["body"].fillna("")
+        ).str.strip()
+
+        # Remove extra whitespace and clean text
+        df["text"] = df["text"].str.replace(r"\s+", " ", regex=True)
+
+        X = df["text"]
+        y = df["label_t180"].apply(lambda x: 1 if x == "Actionable" else 0)
+
+        return X, y
+
+    def _perform_cross_validation(
+        self, pipeline: Pipeline, X: pd.Series, y: pd.Series
+    ) -> Dict[str, float]:
+        """Perform cross-validation and return metrics."""
+        cv = StratifiedKFold(
+            n_splits=self.cv_folds, shuffle=True, random_state=self.random_state
+        )
+
+        # ROC AUC scores
+        roc_scores = cross_val_score(
+            pipeline, X, y, cv=cv, scoring="roc_auc", n_jobs=-1
+        )
+
+        # F1 scores
+        f1_scores = cross_val_score(pipeline, X, y, cv=cv, scoring="f1", n_jobs=-1)
+
+        return {
+            "roc_auc_mean": roc_scores.mean(),
+            "roc_auc_std": roc_scores.std(),
+            "f1_mean": f1_scores.mean(),
+            "f1_std": f1_scores.std(),
+        }
+
+    def _hyperparameter_tuning(
+        self,
+        pipeline: Pipeline,
+        X_train: pd.Series,
+        y_train: pd.Series,
+        classifier_name: str,
+    ) -> Pipeline:
+        """Perform hyperparameter tuning using GridSearchCV."""
+        param_grids = self._get_hyperparameter_grids()
+        param_grid = param_grids.get(classifier_name, {})
+
+        if not param_grid:
+            logger.warning(f"No hyperparameter grid found for {classifier_name}")
+            return pipeline
+
+        logger.info(f"Starting hyperparameter tuning for {classifier_name}...")
+
+        cv = StratifiedKFold(
+            n_splits=min(3, self.cv_folds), shuffle=True, random_state=self.random_state
+        )
+
+        grid_search = GridSearchCV(
+            pipeline, param_grid, cv=cv, scoring="roc_auc", n_jobs=-1, verbose=1
+        )
+
+        grid_search.fit(X_train, y_train)
+
+        logger.info(f"Best parameters: {grid_search.best_params_}")
+        logger.info(f"Best cross-validation score: {grid_search.best_score_:.4f}")
+
+        return grid_search.best_estimator_
+
+    def _evaluate_model(
+        self, pipeline: Pipeline, X_test: pd.Series, y_test: pd.Series, model_name: str
+    ) -> Dict[str, float]:
+        """Comprehensive model evaluation."""
+        y_pred_proba = pipeline.predict_proba(X_test)[:, 1]
+        y_pred = (y_pred_proba > 0.5).astype(int)
+
+        roc_auc = roc_auc_score(y_test, y_pred_proba)
+        f1 = f1_score(y_test, y_pred)
+
+        logger.info(f"\n=== {model_name} Results ===")
+        logger.info(f"Test ROC-AUC: {roc_auc:.4f}")
+        logger.info(f"Test F1 Score: {f1:.4f}")
+        logger.info(
+            f"Classification Report:\n{classification_report(y_test, y_pred, target_names=['Bluff', 'Actionable'])}"
+        )
+
+        # Confusion matrix
+        cm = confusion_matrix(y_test, y_pred)
+        logger.info(f"Confusion Matrix:\n{cm}")
+
+        return {"roc_auc": roc_auc, "f1_score": f1, "model_name": model_name}
+
+    def _extract_feature_importance(
+        self, pipeline: Pipeline, model_name: str
+    ) -> Optional[pd.DataFrame]:
+        """Extract and log feature importance."""
+        try:
+            if hasattr(pipeline.named_steps["classifier"], "coef_"):
+                # For linear models
+                feature_names = pipeline.named_steps["tfidf"].get_feature_names_out()
+                if self.use_feature_selection:
+                    # Get selected features
+                    selected_features = pipeline.named_steps[
+                        "feature_selection"
+                    ].get_support()
+                    feature_names = feature_names[selected_features]
+
+                coefficients = pipeline.named_steps["classifier"].coef_[0]
+
+                feature_importance = pd.DataFrame(
+                    {
+                        "feature": feature_names,
+                        "importance": np.abs(coefficients),
+                        "coefficient": coefficients,
+                    }
+                ).sort_values("importance", ascending=False)
+
+                logger.info(f"\nTop 10 Most Important Features for {model_name}:")
+                logger.info(feature_importance.head(10).to_string(index=False))
+
+                return feature_importance
+
+            elif hasattr(pipeline.named_steps["classifier"], "feature_importances_"):
+                # For tree-based models
+                feature_names = pipeline.named_steps["tfidf"].get_feature_names_out()
+                if self.use_feature_selection:
+                    selected_features = pipeline.named_steps[
+                        "feature_selection"
+                    ].get_support()
+                    feature_names = feature_names[selected_features]
+
+                importances = pipeline.named_steps["classifier"].feature_importances_
+
+                feature_importance = pd.DataFrame(
+                    {"feature": feature_names, "importance": importances}
+                ).sort_values("importance", ascending=False)
+
+                logger.info(f"\nTop 10 Most Important Features for {model_name}:")
+                logger.info(feature_importance.head(10).to_string(index=False))
+
+                return feature_importance
+
+        except Exception as e:
+            logger.warning(
+                f"Could not extract feature importance for {model_name}: {e}"
+            )
+
+        return None
+
+    def train_and_validate(self, df: pd.DataFrame) -> Optional[Any]:
+        """Train and validate multiple models with cross-validation."""
+        try:
+            # Validate input data
+            if not self._validate_data(df):
+                return None
+
+            # Prepare features and target
+            X, y = self._prepare_features(df)
+
+            # Check class balance
+            class_counts = y.value_counts()
+            logger.info(f"Class distribution: {class_counts.to_dict()}")
+
+            if len(class_counts) < 2:
+                logger.error(
+                    "Only one class found in the data. Cannot train classifier."
+                )
+                return None
+
+            # Split data
+            X_train, X_test, y_train, y_test = train_test_split(
+                X,
+                y,
+                test_size=self.test_size,
+                random_state=self.random_state,
+                stratify=y,
+            )
+
+            logger.info(
+                f"Training on {len(X_train)} samples, testing on {len(X_test)} samples"
+            )
+
+            # Models to try
+            models_to_try = (
+                ["logistic", "svm"]
+                if not self.use_ensemble
+                else ["logistic", "svm", "rf"]
+            )
+
+            best_score = 0
+            best_model = None
+            best_model_name = ""
+
+            for model_name in models_to_try:
+                logger.info(f"\n{'='*50}")
+                logger.info(f"Training {model_name.upper()} model")
+                logger.info(f"{'='*50}")
+
+                # Create pipeline
+                pipeline = self._create_base_pipeline(model_name)
+
+                # Hyperparameter tuning
+                if self.use_hyperparameter_tuning:
+                    pipeline = self._hyperparameter_tuning(
+                        pipeline, X_train, y_train, model_name
+                    )
+                else:
+                    pipeline.fit(X_train, y_train)
+
+                # Cross-validation on training data
+                cv_results = self._perform_cross_validation(pipeline, X_train, y_train)
+                logger.info(
+                    f"Cross-validation ROC-AUC: {cv_results['roc_auc_mean']:.4f} (+/- {cv_results['roc_auc_std']*2:.4f})"
+                )
+                logger.info(
+                    f"Cross-validation F1: {cv_results['f1_mean']:.4f} (+/- {cv_results['f1_std']*2:.4f})"
+                )
+
+                # Evaluate on test set
+                test_results = self._evaluate_model(
+                    pipeline, X_test, y_test, model_name
+                )
+
+                # Extract feature importance
+                feature_importance = self._extract_feature_importance(
+                    pipeline, model_name
+                )
+
+                # Keep best model
+                if test_results["roc_auc"] > best_score:
+                    best_score = test_results["roc_auc"]
+                    best_model = pipeline
+                    best_model_name = model_name
+                    self.feature_importance = feature_importance
+
+            # Final evaluation
+            logger.info(f"\n{'='*50}")
+            logger.info(
+                f"BEST MODEL: {best_model_name.upper()} (ROC-AUC: {best_score:.4f})"
+            )
+            logger.info(f"{'='*50}")
+
+            if best_score >= self.target_roc_auc:
+                logger.info(
+                    f"✓ Best model performance meets target (≥{self.target_roc_auc})"
+                )
+            else:
+                logger.warning(
+                    f"⚠ Best model performance below target (≥{self.target_roc_auc})"
+                )
+                logger.info("Consider:")
+                logger.info("- Collecting more training data")
+                logger.info("- Feature engineering")
+                logger.info("- Different algorithms")
+                logger.info("- Adjusting class weights")
+
+            self.best_model = best_model
+            self.best_score = best_score
+
+            return best_model
+
+        except Exception as e:
+            logger.error(f"Error during model training: {str(e)}")
+            return None
+
+    def predict(self, texts: List[str]) -> np.ndarray:
+        """Make predictions on new texts."""
+        if self.best_model is None:
+            raise ValueError("Model not trained yet. Call train_and_validate first.")
+
+        return self.best_model.predict_proba(texts)[:, 1]
+
+    def get_model_info(self) -> Dict[str, Any]:
+        """Get information about the best model."""
+        return {
+            "best_score": self.best_score,
+            "target_score": self.target_roc_auc,
+            "model_type": (
+                type(self.best_model.named_steps["classifier"]).__name__
+                if self.best_model
+                else None
+            ),
+            "feature_count": (
+                len(self.feature_importance)
+                if self.feature_importance is not None
+                else None
+            ),
+            "hyperparameter_tuning": self.use_hyperparameter_tuning,
+            "feature_selection": self.use_feature_selection,
+        }
 
 
 class SklearnTextClassifierTrainer(ModelTrainer):
@@ -413,7 +972,7 @@ def create_pipeline_from_config(config: Dict[str, Any]) -> MLTrainingPipeline:
 
     # Create model trainer
     trainer_config = config.get("trainer", {})
-    model_trainer = SklearnTextClassifierTrainer(**trainer_config)
+    model_trainer = ImprovedSklearnTextClassifierTrainer(**trainer_config)
 
     # Create model saver
     if config.get("model_destination_type") == "local":
@@ -448,7 +1007,7 @@ if __name__ == "__main__":
             "use_s3": False,
             "trainer": {"target_roc_auc": 0.7, "max_features": 5000, "test_size": 0.2},
         }
-        data_source = settings.LOCAL_DATA_PATH
+        data_source = settings.OUTPUT_FILE
         model_destination = settings.LOCAL_MODEL_PATH
 
     try:
